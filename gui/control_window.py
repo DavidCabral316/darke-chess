@@ -22,33 +22,46 @@ class AnalysisThread(QThread):
         self.running = False
         self.region = None
         self.side = 'white'
-        self.last_analyzed_fen = None
-        self.pending_fen = None
+        self.last_analyzed_board = None  # Board part only (no side/castling)
+        self.pending_board = None
         self.confirm_count = 0
 
-    def is_valid_fen(self, fen):
-        """FEN validation: king counts + python-chess legality check."""
+    def validate_and_fix_fen(self, fen):
+        """
+        Validates the FEN and auto-detects the correct side to move.
+        Returns the corrected FEN string, or None if invalid.
+        """
         if not fen:
-            return False
+            return None
             
         parts = fen.split()
         if len(parts) < 1:
-            return False
+            return None
             
         board_part = parts[0]
         
         # Check for exactly one of each King
         if board_part.count('k') != 1 or board_part.count('K') != 1:
-            return False
+            return None
         
-        # Use python-chess to validate the position is parseable
+        # Try both sides to find the valid one
+        for side in ['w', 'b']:
+            test_fen = f"{board_part} {side} KQkq - 0 1"
+            try:
+                board = chess.Board(test_fen)
+                if board.is_valid():
+                    return test_fen
+            except ValueError:
+                continue
+        
+        # If neither is "valid" by strict rules, still allow it if parseable
+        # (is_valid() can be picky about positions that are actually fine for analysis)
         try:
-            board = chess.Board(fen)
-            # Check that there are legal moves (not a corrupt state)
-            # A valid board should be usable even if it's checkmate
-            return board.is_valid()
+            fallback_fen = f"{board_part} w KQkq - 0 1"
+            chess.Board(fallback_fen)  # Just check it parses
+            return fallback_fen
         except ValueError:
-            return False
+            return None
 
     def run(self):
         self.running = True
@@ -61,40 +74,47 @@ class AnalysisThread(QThread):
             frame = self.capture_tool.capture(self.region)
             
             # 2. Get FEN
-            fen = self.vision.get_board_state(frame, self.side)
+            raw_fen = self.vision.get_board_state(frame, self.side)
             
-            # 3. Validate
-            if not fen or not self.is_valid_fen(fen):
-                self.pending_fen = None
+            if not raw_fen:
+                self.pending_board = None
                 self.confirm_count = 0
                 self.msleep(150)
                 continue
             
-            # 4. Multi-frame confirmation: require CONFIRM_FRAMES identical reads
-            if fen == self.pending_fen:
+            # Extract just the board part for comparison (ignore side/castling)
+            board_part = raw_fen.split()[0]
+            
+            # 3. Multi-frame confirmation on BOARD PART only
+            if board_part == self.pending_board:
                 self.confirm_count += 1
             else:
-                # New FEN detected, start counting
-                self.pending_fen = fen
+                self.pending_board = board_part
                 self.confirm_count = 1
             
             if self.confirm_count < CONFIRM_FRAMES:
-                self.msleep(80)  # Fast polling while confirming
+                self.msleep(80)
                 continue
             
-            # 5. Don't re-analyze same confirmed position
-            if fen == self.last_analyzed_fen:
+            # 4. Don't re-analyze same confirmed board
+            if board_part == self.last_analyzed_board:
                 self.msleep(200)
                 continue
+            
+            # 5. Validate and fix the FEN (auto-detect side to move)
+            fen = self.validate_and_fix_fen(raw_fen)
+            if not fen:
+                self.msleep(150)
+                continue
 
-            self.last_analyzed_fen = fen
+            self.last_analyzed_board = board_part
             print(f"Confirmed FEN ({CONFIRM_FRAMES} reads): {fen}")
             
             # 6. Analyze
             best_move = self.engine.analyze(fen, time_limit=1.0)
             
             if best_move:
-                # 7. Validate move legality against the board
+                # 7. Validate move legality
                 try:
                     board = chess.Board(fen)
                     move = chess.Move.from_uci(best_move)
@@ -102,14 +122,14 @@ class AnalysisThread(QThread):
                         print(f"Move: {best_move} ✓ (legal)")
                         self.fen_updated.emit(fen, best_move)
                     else:
-                        print(f"Move: {best_move} ✗ ILLEGAL on {fen} — skipping")
-                        self.last_analyzed_fen = None  # Force re-read
+                        print(f"Move: {best_move} ✗ ILLEGAL — re-reading board")
+                        self.last_analyzed_board = None  # Force re-read
                 except Exception as e:
                     print(f"Move validation error: {e}")
-                    self.last_analyzed_fen = None
+                    self.last_analyzed_board = None
             else:
                 print(f"Engine returned None for FEN: {fen}")
-                self.last_analyzed_fen = None
+                self.last_analyzed_board = None
             
             self.msleep(100)
 
