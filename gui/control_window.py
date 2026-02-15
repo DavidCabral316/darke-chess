@@ -9,7 +9,7 @@ from core.capture import ScreenCapture
 from core.vision import BoardVision
 from core.engine import ChessEngine
 
-CONFIRM_FRAMES = 3  # How many identical reads before we trust the FEN
+CONFIRM_FRAMES = 2  # How many identical reads before we trust the FEN
 
 class AnalysisThread(QThread):
     fen_updated = pyqtSignal(str, str) # FEN, Best Move
@@ -25,42 +25,29 @@ class AnalysisThread(QThread):
         self.last_analyzed_board = None  # Board part only (no side/castling)
         self.pending_board = None
         self.confirm_count = 0
+        self._waiting_logged = False  # Avoid spamming "waiting" messages
 
-    def validate_and_fix_fen(self, fen):
+    def build_fen(self, board_part):
         """
-        Validates the FEN and auto-detects the correct side to move.
-        Uses '-' for castling rights since we can't detect them from vision.
-        Returns the corrected FEN string, or None if invalid.
+        Build a usable FEN from a board part.
+        Always uses the user's side to move so Stockfish always analyzes from our perspective.
+        If the position is in check for the wrong side, we still send it — 
+        Stockfish can handle it and is more tolerant than python-chess's is_valid().
         """
-        if not fen:
+        if not board_part:
             return None
-            
-        parts = fen.split()
-        if len(parts) < 1:
-            return None
-            
-        board_part = parts[0]
         
         # Check for exactly one of each King
         if board_part.count('k') != 1 or board_part.count('K') != 1:
             return None
         
-        # Try both sides to find the valid one
-        # Use '-' for castling (we can't know if rooks/kings have moved)
-        for side in ['w', 'b']:
-            test_fen = f"{board_part} {side} - - 0 1"
-            try:
-                board = chess.Board(test_fen)
-                if board.is_valid():
-                    return test_fen
-            except ValueError:
-                continue
+        my_side = 'w' if self.side == 'white' else 'b'
+        fen = f"{board_part} {my_side} - - 0 1"
         
-        # Fallback: just check if parseable
+        # Just verify it's parseable (don't use is_valid() — too strict for our use case)
         try:
-            fallback_fen = f"{board_part} w - - 0 1"
-            chess.Board(fallback_fen)
-            return fallback_fen
+            chess.Board(fen)
+            return fen
         except ValueError:
             return None
 
@@ -92,6 +79,7 @@ class AnalysisThread(QThread):
             else:
                 self.pending_board = board_part
                 self.confirm_count = 1
+                self._waiting_logged = False  # Reset log flag on board change
             
             if self.confirm_count < CONFIRM_FRAMES:
                 self.msleep(80)
@@ -99,27 +87,22 @@ class AnalysisThread(QThread):
             
             # 4. Don't re-analyze same confirmed board
             if board_part == self.last_analyzed_board:
+                if not self._waiting_logged:
+                    self._waiting_logged = True
                 self.msleep(200)
                 continue
             
-            # 5. Validate and fix the FEN (auto-detect side to move)
-            fen = self.validate_and_fix_fen(raw_fen)
+            # 5. Build FEN with our side to move
+            fen = self.build_fen(board_part)
             if not fen:
-                self.msleep(150)
-                continue
-            
-            # 6. Only analyze when it's OUR turn
-            fen_side = fen.split()[1]  # 'w' or 'b'
-            my_side = 'w' if self.side == 'white' else 'b'
-            if fen_side != my_side:
-                # It's the opponent's turn — wait for them to move
                 self.msleep(150)
                 continue
 
             self.last_analyzed_board = board_part
+            self._waiting_logged = False
             print(f"Confirmed FEN ({CONFIRM_FRAMES} reads): {fen}")
             
-            # 7. Analyze
+            # 6. Analyze
             best_move = self.engine.analyze(fen, time_limit=1.0)
             
             if best_move:
