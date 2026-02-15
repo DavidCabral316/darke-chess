@@ -19,12 +19,14 @@ class AnalysisThread(QThread):
         self.running = False
         self.region = None
         self.side = 'white'
+        self.last_fen = None
 
     def run(self):
         self.running = True
         while self.running:
             if not self.region:
-                break
+                self.msleep(500)
+                continue
             
             # 1. Capture Board
             frame = self.capture_tool.capture(self.region)
@@ -34,10 +36,31 @@ class AnalysisThread(QThread):
             
             # 3. Analyze
             if fen:
-                best_move = self.engine.analyze(fen, time_limit=0.5)
-                self.fen_updated.emit(fen, str(best_move))
+                # Basic validation: ensure King exists
+                if 'k' not in fen.lower(): # Very basic check
+                    # print(f"Invalid FEN (No King): {fen}") # Reduce spam
+                    self.msleep(500)
+                    continue
+                
+                # Optimization: Don't re-analyze same position
+                if fen == self.last_fen:
+                    self.msleep(200) # Faster check if idle
+                    continue
+
+                self.last_fen = fen
+                print(f"New FEN detected: {fen}")
+                
+                best_move = self.engine.analyze(fen, time_limit=1.0) # Give it a bit more time now that we cache
+                
+                if best_move:
+                    print(f"Move: {best_move}")
+                    self.fen_updated.emit(fen, str(best_move))
+                else:
+                    print(f"Engine returned None for FEN: {fen}")
+                    self.fen_updated.emit(fen, "No Move Found (Check logs)")
+                    self.last_fen = None # Retry next time if it failed
             
-            self.msleep(500) # Check every 500ms
+            self.msleep(100) # Fast loop, but governed by FEN change
 
     def stop(self):
         self.running = False
@@ -188,9 +211,25 @@ class ControlWindow(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_calibrate.setEnabled(True)
+        
+        if self.overlay:
+            self.overlay.hide()
 
     def update_info(self, fen, best_move):
-        self.info_label.setText(f"FEN: {fen}\nBest Move: {best_move}")
+        self.status_label.setText(f"FEN: {fen}")
+        self.info_label.setText(f"Best Move: {best_move}")
+        
+        # Draw move on overlay if it's a valid move
+        if self.overlay and self.analysis_thread.region and " " not in best_move and "No Move" not in best_move:
+             # best_move string might be "e2e4" or "e2e4 (CP: 30)" (though currently it's just UCI or error msg)
+             uci_move = best_move.split()[0]
+             
+             # Orientation
+             orientation_text = self.combo_side.currentText()
+             orientation = 'white' if "White" in orientation_text else 'black'
+             
+             # self.analysis_thread.region is (x,y,w,h) tuple, connect expects tuple or list
+             self.overlay.draw_move(uci_move, self.analysis_thread.region, orientation)
 
     def closeEvent(self, event):
         self.analysis_thread.stop()
