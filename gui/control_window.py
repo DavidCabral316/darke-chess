@@ -52,90 +52,89 @@ class AnalysisThread(QThread):
             return 64
         return sum(1 for a, b in zip(s1, s2) if a != b)
 
+    def _is_sane_board(self, board_part):
+        """Strictly validates piece counts and basic chess rules."""
+        try:
+            # 1. Exactly One King
+            if board_part.count('k') != 1 or board_part.count('K') != 1:
+                return False
+            # 2. Maximum pawns
+            if board_part.count('p') > 8 or board_part.count('P') > 8:
+                return False
+            # 3. Piece count should not suddenly increase (hallucinations)
+            # (Wait, pieces can increase during calibration vs mid-game if we have a clean state)
+            # Let's just check for 'insane' density
+            total_pieces = sum(1 for c in board_part if c.isalpha())
+            if total_pieces > 32: return False
+            
+            return True
+        except:
+            return False
+
     def _sync_to_board_part(self, board_part):
         """
-        Attempts to find a legal move that leads to board_part.
-        Tolerates up to 2 misread squares via fuzzy matching and fuzzy "stay".
+        State-Aware Sync: Prioritizes legal paths and filters out hallucinations.
         """
-        # 1. Exact match for current state
+        # I. Sanity Filter
+        if not self._is_sane_board(board_part):
+            self._desync_frames += 1
+            return False
+
+        # II. Exact match for current state (No change)
         if self.virtual_board.board_fen() == board_part:
             self._desync_frames = 0
             return True
 
-        # 2. Check for the start position (Reset)
-        start_board = chess.Board().board_fen()
-        if board_part == start_board:
-            if self.virtual_board.board_fen() != start_board:
-                print("Game reset detected. Resetting virtual board.")
-                self.virtual_board.reset()
-            self._desync_frames = 0
-            return True
-
-        # 3. Exact match for legal moves
-        for move in self.virtual_board.legal_moves:
-            self.virtual_board.push(move)
+        # III. Search Legal Plies (1-2 moves ahead)
+        # This handles Opponent Move -> Our Turn
+        for move1 in self.virtual_board.legal_moves:
+            self.virtual_board.push(move1)
+            # Check 1 ply (Opponent moved)
             if self.virtual_board.board_fen() == board_part:
-                print(f"Detected move: {move.uci()} (exact match)")
+                print(f"Move Recognized: {move1.uci()}")
                 self.move_detected.emit()
                 self._desync_frames = 0
                 return True
+            
+            # Check 2 plies (We moved, now it's our turn again - or we moved and opponent hasn't)
+            # Actually, our turn analysis usually pushes once.
+            
             self.virtual_board.pop()
 
-        # 4. Fuzzy Match for current state (Tolerate vision noise on same board)
+        # IV. Fuzzy Match for continuity (Tolerate 1-2 minor misreads if kings are same)
         curr_diff = self._board_diff_count(self.virtual_board.board_fen(), board_part)
         if curr_diff <= 2:
-            self._desync_frames = 0
-            return True
+            # If kings moved, it's not fuzzy background noise
+            if self.virtual_board.piece_at(chess.E1) == chess.Piece(chess.KING, chess.WHITE) and \
+               board_part.find('K') != -1: # Minimal check
+                self._desync_frames = 0
+                return True
 
-        # 5. Fuzzy Match for legal moves
-        best_fuzzy_move = None
-        min_diff = 99
-        
-        for move in self.virtual_board.legal_moves:
-            self.virtual_board.push(move)
-            diff = self._board_diff_count(self.virtual_board.board_fen(), board_part)
-            if diff < min_diff:
-                min_diff = diff
-                best_fuzzy_move = move
-            self.virtual_board.pop()
-            
-        if best_fuzzy_move and min_diff <= 2:
-            self.virtual_board.push(best_fuzzy_move)
-            print(f"Detected move: {best_fuzzy_move.uci()} (fuzzy match, diff={min_diff})")
-            self.move_detected.emit()
-            self._desync_frames = 0
-            return True
-
-        # 6. Desync Handling
+        # V. Recovery Snap (Last Resort)
         self._desync_frames += 1
-        if self._desync_frames % 10 == 0:
-            print(f"[DEBUG] Desync for {self._desync_frames} frames. Closest legal diff was {min_diff}.")
-            print(f"  Seen: {board_part}")
-            print(f"  State: {self.virtual_board.board_fen()}")
-
-        if self._desync_frames > 40: # ~6 seconds
-             print(f"CRITICAL: Persistent desync ({self._desync_frames} frames). Attempting recovery snap...")
+        if self._desync_frames > 50: # ~7 seconds
+             print(f"CRITICAL: Persistent desync. Checking for board reset or stable state...")
+             # Only snap if board is stable (most common in window) AND sane
+             # Already checked sanity above.
              my_side = 'w' if self.side == 'white' else 'b'
              opp_side = 'b' if self.side == 'white' else 'w'
              
-             # Log King counts for debugging
-             k_count = board_part.count('k') + board_part.count('K')
-             if k_count < 2:
-                 print(f"  Recovery stalled: Vision only sees {k_count} king(s) on board.")
-             
              for s in [my_side, opp_side]:
-                 test_fen = f"{board_part} {s} - - 0 1"
                  try:
+                     test_fen = f"{board_part} {s} - - 0 1"
                      b = chess.Board(test_fen)
-                     # Snapping is the last resort. We accept it if we see at least 1 king of each color
-                     # (or at least 2 kings total if we can't distinguish due to noise)
-                     if board_part.count('k') >= 1 and board_part.count('K') >= 1:
-                         print(f"Recovery SUCCESS: Snapping to {s} to move.")
-                         self.virtual_board = b
-                         self.last_analyzed_board = None # Force re-analysis
-                         self._desync_frames = 0
-                         return True
-                 except: continue
+                     if not b.is_valid():
+                         continue
+                     
+                     print(f"Recovery SUCCESS: Snapping to {s} to move.")
+                     self.virtual_board = b
+                     self.last_analyzed_board = None
+                     self._desync_frames = 0
+                     return True
+                 except Exception as e:
+                     if self._desync_frames % 20 == 0:
+                         print(f"[DEBUG] Recovery FEN invalid: {test_fen}")
+                     continue
         
         return False
 
@@ -182,15 +181,21 @@ class AnalysisThread(QThread):
             
             confirmed_board = self._get_most_common_board()
             if confirmed_board is None:
+                if self._stall_counter % 20 == 0:
+                    print(f"[DEBUG] Waiting for vision consensus... (Window: {len(self.recent_reads)})")
+                self._stall_counter += 1
                 self.msleep(80)
                 continue
             
             # 4. State Tracking & Sync
             if not self._sync_to_board_part(confirmed_board):
+                if self._desync_frames % 20 == 0 and self._desync_frames > 0:
+                     print(f"[DEBUG] Searching for sync with: {confirmed_board}")
                 self.msleep(100)
                 continue
             
-            self._desync_frames = 0 # In sync
+            self._desync_frames = 0 
+            self._stall_counter = 0
             
             # 5. Turn Gating
             my_side_code = 'w' if self.side == 'white' else 'b'

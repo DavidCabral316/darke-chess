@@ -138,49 +138,58 @@ class ChessEngine:
         """Check if the engine process is still running."""
         return self.process is not None and self.process.poll() is None
 
+    def _is_sane_fen(self, fen):
+        """Basic sanity check to prevent Stockfish from hanging on garbage FENs."""
+        try:
+            parts = fen.split()
+            if len(parts) < 1: return False
+            board_part = parts[0]
+            # Must have exactly one white king and one black king
+            if board_part.count('K') != 1 or board_part.count('k') != 1:
+                return False
+            # Check row counts
+            rows = board_part.split('/')
+            if len(rows) != 8: return False
+            return True
+        except:
+            return False
+
     def analyze(self, fen, time_limit=1.0, skill_level=None):
         """
-        Analyzes the given FEN position.
-        :param fen: FEN string of the position.
-        :param time_limit: Time to analyze in seconds.
-        :param skill_level: Optional skill level (0-20).
-        :return: Best move string (e.g. "e2e4") or None.
+        Analyzes the given FEN position with sanity checks.
         """
+        if not self._is_sane_fen(fen):
+            print(f"Engine Warning: Suppressing insane FEN: {fen}")
+            return None
+
         with self._lock:
-            # Auto-restart if engine is dead
             if not self._is_alive():
                 print("Engine is not running. Restarting...")
                 self._start_internal()
-                if not self._is_alive():
-                    return None
+                if not self._is_alive(): return None
 
             try:
-                # Set skill level if needed
                 if skill_level is not None:
                     self._send(f"setoption name Skill Level value {skill_level}")
                 
-                # Drain any leftover output from previous commands
+                # Drain queue
                 while not self._output_queue.empty():
-                    try:
-                        self._output_queue.get_nowait()
-                    except queue.Empty:
-                        break
+                    try: self._output_queue.get_nowait()
+                    except queue.Empty: break
                 
-                # Set position and search
                 self._send(f"position fen {fen}")
                 self._send("isready")
                 
-                if not self._wait_for("readyok", timeout=3.0):
-                    print("Engine not ready, restarting...")
+                if not self._wait_for("readyok", timeout=2.0):
+                    print("Engine not responding to isready, force restarting...")
                     self._cleanup_process()
                     return None
                 
                 time_ms = int(time_limit * 1000)
                 self._send(f"go movetime {time_ms}")
                 
-                # Wait for bestmove with generous timeout
-                timeout = time_limit + 5.0
-                line = self._wait_for("bestmove", timeout=timeout)
+                # Wait for bestmove
+                line = self._wait_for("bestmove", timeout=time_limit + 3.0)
                 
                 if line:
                     parts = line.split()
