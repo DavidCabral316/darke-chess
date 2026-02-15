@@ -107,11 +107,19 @@ class AnalysisThread(QThread):
             if not fen:
                 self.msleep(150)
                 continue
+            
+            # 6. Only analyze when it's OUR turn
+            fen_side = fen.split()[1]  # 'w' or 'b'
+            my_side = 'w' if self.side == 'white' else 'b'
+            if fen_side != my_side:
+                # It's the opponent's turn — wait for them to move
+                self.msleep(150)
+                continue
 
             self.last_analyzed_board = board_part
             print(f"Confirmed FEN ({CONFIRM_FRAMES} reads): {fen}")
             
-            # 6. Analyze
+            # 7. Analyze
             best_move = self.engine.analyze(fen, time_limit=1.0)
             
             if best_move:
