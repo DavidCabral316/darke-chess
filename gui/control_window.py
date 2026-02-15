@@ -1,4 +1,5 @@
 import sys
+import chess
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
                              QLabel, QComboBox, QCheckBox, QGroupBox, QMessageBox)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
@@ -7,6 +8,8 @@ from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from core.capture import ScreenCapture
 from core.vision import BoardVision
 from core.engine import ChessEngine
+
+CONFIRM_FRAMES = 3  # How many identical reads before we trust the FEN
 
 class AnalysisThread(QThread):
     fen_updated = pyqtSignal(str, str) # FEN, Best Move
@@ -19,10 +22,12 @@ class AnalysisThread(QThread):
         self.running = False
         self.region = None
         self.side = 'white'
-        self.last_fen = None
+        self.last_analyzed_fen = None
+        self.pending_fen = None
+        self.confirm_count = 0
 
     def is_valid_fen(self, fen):
-        """Basic FEN validation to prevent engine crashes."""
+        """FEN validation: king counts + python-chess legality check."""
         if not fen:
             return False
             
@@ -32,12 +37,18 @@ class AnalysisThread(QThread):
             
         board_part = parts[0]
         
-        # Check for exactly one of each King in the BOARD PART ONLY
-        # (Previous bug counted 'k'/'K' in castling rights "KQkq", causing false negatives)
+        # Check for exactly one of each King
         if board_part.count('k') != 1 or board_part.count('K') != 1:
             return False
-            
-        return True
+        
+        # Use python-chess to validate the position is parseable
+        try:
+            board = chess.Board(fen)
+            # Check that there are legal moves (not a corrupt state)
+            # A valid board should be usable even if it's checkmate
+            return board.is_valid()
+        except ValueError:
+            return False
 
     def run(self):
         self.running = True
@@ -52,32 +63,55 @@ class AnalysisThread(QThread):
             # 2. Get FEN
             fen = self.vision.get_board_state(frame, self.side)
             
-            # 3. Analyze
-            if fen:
-                # Validation: ensure exactly one King of each color
-                if not self.is_valid_fen(fen):
-                    # print(f"Invalid FEN (Kings check failed): {fen}") 
-                    self.msleep(200) # Retry faster to get a good frame
-                    continue
-                
-                # Optimization: Don't re-analyze same position
-                if fen == self.last_fen:
-                    self.msleep(200) # Faster check if idle
-                    continue
-
-                self.last_fen = fen
-                print(f"New FEN detected: {fen}")
-                
-                best_move = self.engine.analyze(fen, time_limit=1.0)
-                
-                if best_move:
-                    print(f"Move: {best_move}")
-                    self.fen_updated.emit(fen, best_move)
-                else:
-                    print(f"Engine returned None for FEN: {fen}")
-                    self.last_fen = None # Retry next time if it failed
+            # 3. Validate
+            if not fen or not self.is_valid_fen(fen):
+                self.pending_fen = None
+                self.confirm_count = 0
+                self.msleep(150)
+                continue
             
-            self.msleep(100) # Fast loop, but governed by FEN change
+            # 4. Multi-frame confirmation: require CONFIRM_FRAMES identical reads
+            if fen == self.pending_fen:
+                self.confirm_count += 1
+            else:
+                # New FEN detected, start counting
+                self.pending_fen = fen
+                self.confirm_count = 1
+            
+            if self.confirm_count < CONFIRM_FRAMES:
+                self.msleep(80)  # Fast polling while confirming
+                continue
+            
+            # 5. Don't re-analyze same confirmed position
+            if fen == self.last_analyzed_fen:
+                self.msleep(200)
+                continue
+
+            self.last_analyzed_fen = fen
+            print(f"Confirmed FEN ({CONFIRM_FRAMES} reads): {fen}")
+            
+            # 6. Analyze
+            best_move = self.engine.analyze(fen, time_limit=1.0)
+            
+            if best_move:
+                # 7. Validate move legality against the board
+                try:
+                    board = chess.Board(fen)
+                    move = chess.Move.from_uci(best_move)
+                    if move in board.legal_moves:
+                        print(f"Move: {best_move} ✓ (legal)")
+                        self.fen_updated.emit(fen, best_move)
+                    else:
+                        print(f"Move: {best_move} ✗ ILLEGAL on {fen} — skipping")
+                        self.last_analyzed_fen = None  # Force re-read
+                except Exception as e:
+                    print(f"Move validation error: {e}")
+                    self.last_analyzed_fen = None
+            else:
+                print(f"Engine returned None for FEN: {fen}")
+                self.last_analyzed_fen = None
+            
+            self.msleep(100)
 
     def stop(self):
         self.running = False
