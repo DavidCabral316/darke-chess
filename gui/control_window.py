@@ -29,6 +29,7 @@ class AnalysisThread(QThread):
     def validate_and_fix_fen(self, fen):
         """
         Validates the FEN and auto-detects the correct side to move.
+        Uses '-' for castling rights since we can't detect them from vision.
         Returns the corrected FEN string, or None if invalid.
         """
         if not fen:
@@ -45,8 +46,9 @@ class AnalysisThread(QThread):
             return None
         
         # Try both sides to find the valid one
+        # Use '-' for castling (we can't know if rooks/kings have moved)
         for side in ['w', 'b']:
-            test_fen = f"{board_part} {side} KQkq - 0 1"
+            test_fen = f"{board_part} {side} - - 0 1"
             try:
                 board = chess.Board(test_fen)
                 if board.is_valid():
@@ -54,11 +56,10 @@ class AnalysisThread(QThread):
             except ValueError:
                 continue
         
-        # If neither is "valid" by strict rules, still allow it if parseable
-        # (is_valid() can be picky about positions that are actually fine for analysis)
+        # Fallback: just check if parseable
         try:
-            fallback_fen = f"{board_part} w KQkq - 0 1"
-            chess.Board(fallback_fen)  # Just check it parses
+            fallback_fen = f"{board_part} w - - 0 1"
+            chess.Board(fallback_fen)
             return fallback_fen
         except ValueError:
             return None
