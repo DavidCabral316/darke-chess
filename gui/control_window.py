@@ -27,46 +27,58 @@ class AnalysisThread(QThread):
         self.last_analyzed_board = None  # Board part only (no side/castling)
         self.recent_reads = []  # Rolling window of recent board reads
         self._stall_counter = 0  # Count frames without a new confirmed FEN
-        self._last_log_turn = None # Track last logged turn state to avoid spam
+        
+        # Stateful tracking
+        self.virtual_board = chess.Board()
+        self._desync_frames = 0
+        self._last_logged_status = None
 
-    def build_fen(self, board_part):
+    def _sync_to_board_part(self, board_part):
         """
-        Build a usable FEN from a board part.
-        Detects side-to-move using chess rules (e.g., side cannot be in check on their own turn).
+        Attempts to find a legal move that leads to board_part.
+        If not found, or if it's the start position, re-initializes.
+        Returns True if a move was applied or board was synced.
         """
-        if not board_part:
-            return (None, None)
-        
-        # Check for exactly one of each King
-        if board_part.count('k') != 1 or board_part.count('K') != 1:
-            return (None, None)
-        
-        # Determine side to move using chess rules
-        detected_side = None
-        for side in ['w', 'b']:
-            test_fen = f"{board_part} {side} - - 0 1"
-            try:
-                board = chess.Board(test_fen)
-                # A position is "valid" in chess if the king of the side 
-                # that just moved (NOT the side to move) is NOT in check.
-                # python-chess's board.is_valid() checks this and other things.
-                if board.is_valid():
-                    detected_side = side
-                    break
-            except ValueError:
-                continue
-        
-        # Fallback if both/neither are perfectly valid
-        if not detected_side:
-            # Assume user's turn as default to avoid permanent stall
-            detected_side = 'w' if self.side == 'white' else 'b'
+        # 1. Check if it's already in sync
+        if self.virtual_board.board_fen() == board_part:
+            return True
 
-        fen = f"{board_part} {detected_side} - - 0 1"
-        try:
-            chess.Board(fen)
-            return (fen, detected_side)
-        except ValueError:
-            return (None, None)
+        # 2. Check if it's the start position (Reset)
+        start_board = chess.Board().board_fen()
+        if board_part == start_board:
+            if self.virtual_board.board_fen() != start_board:
+                print("Game reset detected. Resetting virtual board.")
+                self.virtual_board.reset()
+            return True
+
+        # 3. Check for legal moves
+        for move in self.virtual_board.legal_moves:
+            self.virtual_board.push(move)
+            if self.virtual_board.board_fen() == board_part:
+                print(f"Detected move: {move.uci()} (applied to state)")
+                return True
+            self.virtual_board.pop()
+
+        # 4. If nothing matches, increment desync
+        self._desync_frames += 1
+        if self._desync_frames > 15: # ~2.5 seconds of consistent desync
+             # Force sync using heuristic for turn detection
+             # Try user's turn first, then opponent's
+             my_side = 'w' if self.side == 'white' else 'b'
+             opp_side = 'b' if self.side == 'white' else 'w'
+             
+             for s in [my_side, opp_side]:
+                 test_fen = f"{board_part} {s} - - 0 1"
+                 try:
+                     b = chess.Board(test_fen)
+                     if b.is_valid():
+                         print(f"Desync recovered. Snapping to {s} to move.")
+                         self.virtual_board = b
+                         self._desync_frames = 0
+                         return True
+                 except: continue
+        
+        return False
 
     def _get_most_common_board(self):
         """Return the most common board reading from the rolling window, or None."""
@@ -81,6 +93,7 @@ class AnalysisThread(QThread):
 
     def run(self):
         self.running = True
+        print(f"Analysis started. Playing as: {self.side}")
         while self.running:
             if not self.region:
                 self.msleep(500)
@@ -100,7 +113,7 @@ class AnalysisThread(QThread):
                 self.msleep(150)
                 continue
             
-            # Extract just the board part for comparison (ignore side/castling)
+            # Extract just the board part for comparison
             board_part = raw_fen.split()[0]
             
             # 3. Rolling window confirmation
@@ -109,69 +122,66 @@ class AnalysisThread(QThread):
                 self.recent_reads.pop(0)
             
             confirmed_board = self._get_most_common_board()
-            
             if confirmed_board is None:
-                self._stall_counter += 1
-                if self._stall_counter % DEBUG_INTERVAL == 0:
-                    # Show what the vision is reading for diagnostics
-                    unique = set(self.recent_reads)
-                    print(f"[DEBUG] No consensus after {self._stall_counter} frames. "
-                          f"Unique readings: {len(unique)}")
-                    for u in list(unique)[:3]:  # Show at most 3
-                        print(f"  → {u}")
                 self.msleep(80)
                 continue
             
-            # 4. Detect side to move
-            fen, turn = self.build_fen(confirmed_board)
-            if not fen:
-                self.msleep(150)
-                continue
-
-            my_turn_side = 'w' if self.side == 'white' else 'b'
-            
-            # 5. Check if it's our turn
-            if turn != my_turn_side:
-                if self._last_log_turn != turn:
-                    print(f"Waiting for opponent... (Detected side to move: {turn})")
-                    self._last_log_turn = turn
-                self.msleep(200)
+            # 4. State Tracking & Sync
+            if not self._sync_to_board_part(confirmed_board):
+                self.msleep(100)
                 continue
             
-            # Reset log turn once it IS our turn
-            self._last_log_turn = turn
-
-            # 6. Don't re-analyze same confirmed board
-            if confirmed_board == self.last_analyzed_board:
-                self.msleep(200)
+            self._desync_frames = 0 # In sync
+            
+            # 5. Turn Gating
+            my_side_code = 'w' if self.side == 'white' else 'b'
+            current_turn = 'w' if self.virtual_board.turn else 'b'
+            
+            if current_turn != my_side_code:
+                status = "Waiting for opponent move..."
+                if self._last_logged_status != status:
+                    print(status)
+                    self._last_logged_status = status
+                self.msleep(300)
                 continue
 
-            self.last_analyzed_board = confirmed_board
-            self._stall_counter = 0
-            print(f"Confirmed FEN: {fen}")
+            # 6. Don't re-analyze same board state
+            # Note: last_analyzed_board now stores the full internal FEN to be precise
+            current_full_fen = self.virtual_board.fen()
+            if current_full_fen == self.last_analyzed_board:
+                status = "Waiting for your move..."
+                if self._last_logged_status != status:
+                    # Only print this if we just finished an analysis or resumed
+                    self._last_logged_status = status
+                self.msleep(300)
+                continue
+
+            self._last_logged_status = "Analyzing..."
+            self.last_analyzed_board = current_full_fen
+            print(f"Your turn. Analyzing: {current_full_fen}")
             
             # 7. Analyze
-            best_move = self.engine.analyze(fen, time_limit=1.0)
+            best_move = self.engine.analyze(current_full_fen, time_limit=1.0)
             
             if best_move:
-                # 8. Validate move legality
+                # 8. Double-check move legality on our virtual board
                 try:
-                    board = chess.Board(fen)
                     move = chess.Move.from_uci(best_move)
-                    if move in board.legal_moves:
-                        print(f"Move: {best_move} ✓ (legal)")
-                        self.fen_updated.emit(fen, best_move)
+                    if move in self.virtual_board.legal_moves:
+                        print(f"Suggestion: {best_move} ✓")
+                        self.fen_updated.emit(current_full_fen, best_move)
                     else:
-                        print(f"Move: {best_move} ✗ ILLEGAL — re-reading board")
-                        self.last_analyzed_board = None  # Force re-read
+                        print(f"Warning: Engine suggested illegal move {best_move}")
+                        self.last_analyzed_board = None
                 except Exception as e:
-                    print(f"Move validation error: {e}")
+                    print(f"Analysis validation error: {e}")
                     self.last_analyzed_board = None
             else:
-                print(f"Engine returned None for FEN: {fen}")
+                print("Engine analysis failed (None returned)")
                 self.last_analyzed_board = None
             
             self.msleep(100)
+
 
 
     def stop(self):
