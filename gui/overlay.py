@@ -1,3 +1,4 @@
+import ctypes
 from PyQt6.QtWidgets import QWidget, QApplication, QRubberBand
 from PyQt6.QtCore import Qt, QRect, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen
@@ -24,6 +25,27 @@ class OverlayWindow(QWidget):
         
         # Rubber band for selection visual
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
+
+    def set_click_through(self, enable: bool):
+        """
+        Sets the window to be transparent to mouse events using Windows API.
+        """
+        hwnd = int(self.winId())
+        GWL_EXSTYLE = -20
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_LAYERED = 0x00080000
+
+        # Get current style
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        
+        if enable:
+            # Add Transparent and Layered flags
+            style = style | WS_EX_TRANSPARENT | WS_EX_LAYERED
+        else:
+            # Remove Transparent flag
+            style = style & ~WS_EX_TRANSPARENT
+            
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
     def start_selection_mode(self):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
