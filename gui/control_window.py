@@ -27,28 +27,46 @@ class AnalysisThread(QThread):
         self.last_analyzed_board = None  # Board part only (no side/castling)
         self.recent_reads = []  # Rolling window of recent board reads
         self._stall_counter = 0  # Count frames without a new confirmed FEN
+        self._last_log_turn = None # Track last logged turn state to avoid spam
 
     def build_fen(self, board_part):
         """
         Build a usable FEN from a board part.
-        Always uses the user's side to move so Stockfish always analyzes from our perspective.
+        Detects side-to-move using chess rules (e.g., side cannot be in check on their own turn).
         """
         if not board_part:
-            return None
+            return (None, None)
         
         # Check for exactly one of each King
         if board_part.count('k') != 1 or board_part.count('K') != 1:
-            return None
+            return (None, None)
         
-        my_side = 'w' if self.side == 'white' else 'b'
-        fen = f"{board_part} {my_side} - - 0 1"
+        # Determine side to move using chess rules
+        detected_side = None
+        for side in ['w', 'b']:
+            test_fen = f"{board_part} {side} - - 0 1"
+            try:
+                board = chess.Board(test_fen)
+                # A position is "valid" in chess if the king of the side 
+                # that just moved (NOT the side to move) is NOT in check.
+                # python-chess's board.is_valid() checks this and other things.
+                if board.is_valid():
+                    detected_side = side
+                    break
+            except ValueError:
+                continue
         
-        # Just verify it's parseable
+        # Fallback if both/neither are perfectly valid
+        if not detected_side:
+            # Assume user's turn as default to avoid permanent stall
+            detected_side = 'w' if self.side == 'white' else 'b'
+
+        fen = f"{board_part} {detected_side} - - 0 1"
         try:
             chess.Board(fen)
-            return fen
+            return (fen, detected_side)
         except ValueError:
-            return None
+            return (None, None)
 
     def _get_most_common_board(self):
         """Return the most common board reading from the rolling window, or None."""
@@ -104,26 +122,39 @@ class AnalysisThread(QThread):
                 self.msleep(80)
                 continue
             
-            # 4. Don't re-analyze same confirmed board
-            if confirmed_board == self.last_analyzed_board:
+            # 4. Detect side to move
+            fen, turn = self.build_fen(confirmed_board)
+            if not fen:
+                self.msleep(150)
+                continue
+
+            my_turn_side = 'w' if self.side == 'white' else 'b'
+            
+            # 5. Check if it's our turn
+            if turn != my_turn_side:
+                if self._last_log_turn != turn:
+                    print(f"Waiting for opponent... (Detected side to move: {turn})")
+                    self._last_log_turn = turn
                 self.msleep(200)
                 continue
             
-            # 5. Build FEN with our side to move
-            fen = self.build_fen(confirmed_board)
-            if not fen:
-                self.msleep(150)
+            # Reset log turn once it IS our turn
+            self._last_log_turn = turn
+
+            # 6. Don't re-analyze same confirmed board
+            if confirmed_board == self.last_analyzed_board:
+                self.msleep(200)
                 continue
 
             self.last_analyzed_board = confirmed_board
             self._stall_counter = 0
             print(f"Confirmed FEN: {fen}")
             
-            # 6. Analyze
+            # 7. Analyze
             best_move = self.engine.analyze(fen, time_limit=1.0)
             
             if best_move:
-                # 7. Validate move legality
+                # 8. Validate move legality
                 try:
                     board = chess.Board(fen)
                     move = chess.Move.from_uci(best_move)
@@ -141,6 +172,7 @@ class AnalysisThread(QThread):
                 self.last_analyzed_board = None
             
             self.msleep(100)
+
 
     def stop(self):
         self.running = False
