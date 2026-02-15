@@ -9,7 +9,9 @@ from core.capture import ScreenCapture
 from core.vision import BoardVision
 from core.engine import ChessEngine
 
-CONFIRM_FRAMES = 2  # How many identical reads before we trust the FEN
+CONFIRM_THRESHOLD = 2  # Need this many identical reads out of the rolling window
+WINDOW_SIZE = 5        # Rolling window of recent reads
+DEBUG_INTERVAL = 10    # Print debug info every N frames when stuck
 
 class AnalysisThread(QThread):
     fen_updated = pyqtSignal(str, str) # FEN, Best Move
@@ -23,16 +25,13 @@ class AnalysisThread(QThread):
         self.region = None
         self.side = 'white'
         self.last_analyzed_board = None  # Board part only (no side/castling)
-        self.pending_board = None
-        self.confirm_count = 0
-        self._waiting_logged = False  # Avoid spamming "waiting" messages
+        self.recent_reads = []  # Rolling window of recent board reads
+        self._stall_counter = 0  # Count frames without a new confirmed FEN
 
     def build_fen(self, board_part):
         """
         Build a usable FEN from a board part.
         Always uses the user's side to move so Stockfish always analyzes from our perspective.
-        If the position is in check for the wrong side, we still send it — 
-        Stockfish can handle it and is more tolerant than python-chess's is_valid().
         """
         if not board_part:
             return None
@@ -44,12 +43,23 @@ class AnalysisThread(QThread):
         my_side = 'w' if self.side == 'white' else 'b'
         fen = f"{board_part} {my_side} - - 0 1"
         
-        # Just verify it's parseable (don't use is_valid() — too strict for our use case)
+        # Just verify it's parseable
         try:
             chess.Board(fen)
             return fen
         except ValueError:
             return None
+
+    def _get_most_common_board(self):
+        """Return the most common board reading from the rolling window, or None."""
+        if not self.recent_reads:
+            return None
+        from collections import Counter
+        counts = Counter(self.recent_reads)
+        board, count = counts.most_common(1)[0]
+        if count >= CONFIRM_THRESHOLD:
+            return board
+        return None
 
     def run(self):
         self.running = True
@@ -65,42 +75,49 @@ class AnalysisThread(QThread):
             raw_fen = self.vision.get_board_state(frame, self.side)
             
             if not raw_fen:
-                self.pending_board = None
-                self.confirm_count = 0
+                self.recent_reads.clear()
+                self._stall_counter += 1
+                if self._stall_counter % DEBUG_INTERVAL == 0:
+                    print(f"[DEBUG] Vision returned None ({self._stall_counter} frames)")
                 self.msleep(150)
                 continue
             
             # Extract just the board part for comparison (ignore side/castling)
             board_part = raw_fen.split()[0]
             
-            # 3. Multi-frame confirmation on BOARD PART only
-            if board_part == self.pending_board:
-                self.confirm_count += 1
-            else:
-                self.pending_board = board_part
-                self.confirm_count = 1
-                self._waiting_logged = False  # Reset log flag on board change
+            # 3. Rolling window confirmation
+            self.recent_reads.append(board_part)
+            if len(self.recent_reads) > WINDOW_SIZE:
+                self.recent_reads.pop(0)
             
-            if self.confirm_count < CONFIRM_FRAMES:
+            confirmed_board = self._get_most_common_board()
+            
+            if confirmed_board is None:
+                self._stall_counter += 1
+                if self._stall_counter % DEBUG_INTERVAL == 0:
+                    # Show what the vision is reading for diagnostics
+                    unique = set(self.recent_reads)
+                    print(f"[DEBUG] No consensus after {self._stall_counter} frames. "
+                          f"Unique readings: {len(unique)}")
+                    for u in list(unique)[:3]:  # Show at most 3
+                        print(f"  → {u}")
                 self.msleep(80)
                 continue
             
             # 4. Don't re-analyze same confirmed board
-            if board_part == self.last_analyzed_board:
-                if not self._waiting_logged:
-                    self._waiting_logged = True
+            if confirmed_board == self.last_analyzed_board:
                 self.msleep(200)
                 continue
             
             # 5. Build FEN with our side to move
-            fen = self.build_fen(board_part)
+            fen = self.build_fen(confirmed_board)
             if not fen:
                 self.msleep(150)
                 continue
 
-            self.last_analyzed_board = board_part
-            self._waiting_logged = False
-            print(f"Confirmed FEN ({CONFIRM_FRAMES} reads): {fen}")
+            self.last_analyzed_board = confirmed_board
+            self._stall_counter = 0
+            print(f"Confirmed FEN: {fen}")
             
             # 6. Analyze
             best_move = self.engine.analyze(fen, time_limit=1.0)
