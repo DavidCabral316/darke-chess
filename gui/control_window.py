@@ -15,6 +15,7 @@ DEBUG_INTERVAL = 10    # Print debug info every N frames when stuck
 
 class AnalysisThread(QThread):
     fen_updated = pyqtSignal(str, str) # FEN, Best Move
+    move_detected = pyqtSignal()      # Signal to clear markers
 
     def __init__(self, capture, vision, engine):
         super().__init__()
@@ -75,6 +76,7 @@ class AnalysisThread(QThread):
             self.virtual_board.push(move)
             if self.virtual_board.board_fen() == board_part:
                 print(f"Detected move: {move.uci()} (exact match)")
+                self.move_detected.emit()
                 self._desync_frames = 0
                 return True
             self.virtual_board.pop()
@@ -100,6 +102,7 @@ class AnalysisThread(QThread):
         if best_fuzzy_move and min_diff <= 2:
             self.virtual_board.push(best_fuzzy_move)
             print(f"Detected move: {best_fuzzy_move.uci()} (fuzzy match, diff={min_diff})")
+            self.move_detected.emit()
             self._desync_frames = 0
             return True
 
@@ -257,6 +260,7 @@ class ControlWindow(QWidget):
         # Analysis Thread
         self.analysis_thread = AnalysisThread(self.capture_tool, self.vision, self.engine)
         self.analysis_thread.fen_updated.connect(self.update_info)
+        self.analysis_thread.move_detected.connect(self.clear_overlay)
 
         self.init_ui()
 
@@ -386,6 +390,10 @@ class ControlWindow(QWidget):
         
         if self.overlay:
             self.overlay.hide()
+
+    def clear_overlay(self):
+        if self.overlay:
+            self.overlay.clear()
 
     def update_info(self, fen, best_move):
         self.status_label.setText(f"FEN: {fen}")
