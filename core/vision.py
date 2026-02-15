@@ -87,6 +87,21 @@ class BoardVision:
         self.is_calibrated = True
         print(f"Calibration complete. Templates stored: {len(self.templates)}")
 
+    def _is_check_highlight(self, sq_img):
+        """
+        Detects the deep red/maroon highlight chess.com uses for a king in check.
+        """
+        # Average color of the square
+        avg_color = np.mean(sq_img, axis=(0, 1))
+        # Maroon is typically low in Blue/Green, higher in Red.
+        # Standard: [B, G, R]
+        b, g, r = avg_color
+        # Maroon on chess.com is roughly [40, 60, 180] or similar.
+        # Key: Red should be significantly higher than Blue and Green.
+        if r > 100 and r > g * 1.5 and r > b * 1.5:
+            return True
+        return False
+
     def get_board_state(self, image, orientation='white'):
         if not self.is_calibrated:
             return None
@@ -100,15 +115,13 @@ class BoardVision:
             for c in range(8):
                 sq_img = squares[r][c]
                 sq_color = (r + c) % 2
+                in_check = self._is_check_highlight(sq_img)
                 
                 best_match = None
                 min_diff = float('inf')
                 
-                # Compare against all known templates for this square colors
                 # Candidates: Empty + all pieces
-                candidates = ['empty']
-                candidates += ['r', 'n', 'b', 'q', 'k', 'p', 'R', 'N', 'B', 'Q', 'K', 'P']
-                
+                candidates = ['empty', 'r', 'n', 'b', 'q', 'k', 'p', 'R', 'N', 'B', 'Q', 'K', 'P']
                 matched_symbol = None
                 
                 for sym in candidates:
@@ -116,12 +129,20 @@ class BoardVision:
                     if key in self.templates:
                         template = self.templates[key]
                         
-                        # Resize if needed (should represent same size though)
                         if template.shape != sq_img.shape:
                             template = cv2.resize(template, (sq_img.shape[1], sq_img.shape[0]))
                             
-                        # Simple SSD (Sum of Squared Differences)
+                        # If in check, Piece-only comparison (experimental)
+                        # We try to ignore background by subtracting the mean or using a threshold?
+                        # For now, let's try a standard match but if it's red, boost 'k'/'K'
                         diff = np.sum((sq_img.astype("float") - template.astype("float")) ** 2)
+                        
+                        # Penalty/Boost logic
+                        if in_check:
+                            if sym.lower() == 'k':
+                                diff *= 0.5 # Boost king detection on red squares
+                            elif sym == 'empty':
+                                diff *= 2.0 # Penalize empty on red squares
                         
                         if diff < min_diff:
                             min_diff = diff
@@ -140,9 +161,5 @@ class BoardVision:
             fen_rows.append(row_str)
             
         fen = "/".join(fen_rows)
-        
-        # Add metadata (active color, castling, etc. - simplified for now)
-        # We assume it's White's turn if we are analyzing continuously, OR we need to detect turn.
-        # For now, default to 'w' and full castling availability
         fen += " w KQkq - 0 1" 
         return fen

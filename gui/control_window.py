@@ -113,18 +113,24 @@ class AnalysisThread(QThread):
             print(f"  Seen: {board_part}")
             print(f"  State: {self.virtual_board.board_fen()}")
 
-        if self._desync_frames > 25: # ~4 seconds
-             print(f"CRITICAL: Persistent desync. Attempting recovery snap...")
+        if self._desync_frames > 40: # ~6 seconds
+             print(f"CRITICAL: Persistent desync ({self._desync_frames} frames). Attempting recovery snap...")
              my_side = 'w' if self.side == 'white' else 'b'
              opp_side = 'b' if self.side == 'white' else 'w'
+             
+             # Log King counts for debugging
+             k_count = board_part.count('k') + board_part.count('K')
+             if k_count < 2:
+                 print(f"  Recovery stalled: Vision only sees {k_count} king(s) on board.")
              
              for s in [my_side, opp_side]:
                  test_fen = f"{board_part} {s} - - 0 1"
                  try:
                      b = chess.Board(test_fen)
-                     # Require at least one king per side for a sane snap
-                     if board_part.count('k') == 1 and board_part.count('K') == 1:
-                         print(f"Recovery success: Snapping to {s} to move.")
+                     # Snapping is the last resort. We accept it if we see at least 1 king of each color
+                     # (or at least 2 kings total if we can't distinguish due to noise)
+                     if board_part.count('k') >= 1 and board_part.count('K') >= 1:
+                         print(f"Recovery SUCCESS: Snapping to {s} to move.")
                          self.virtual_board = b
                          self.last_analyzed_board = None # Force re-analysis
                          self._desync_frames = 0
