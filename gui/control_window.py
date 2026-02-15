@@ -21,6 +21,24 @@ class AnalysisThread(QThread):
         self.side = 'white'
         self.last_fen = None
 
+    def is_valid_fen(self, fen):
+        """Basic FEN validation to prevent engine crashes."""
+        if not fen:
+            return False
+            
+        parts = fen.split()
+        if len(parts) < 1:
+            return False
+            
+        board_part = parts[0]
+        
+        # Check for exactly one of each King in the BOARD PART ONLY
+        # (Previous bug counted 'k'/'K' in castling rights "KQkq", causing false negatives)
+        if board_part.count('k') != 1 or board_part.count('K') != 1:
+            return False
+            
+        return True
+
     def run(self):
         self.running = True
         while self.running:
@@ -36,10 +54,10 @@ class AnalysisThread(QThread):
             
             # 3. Analyze
             if fen:
-                # Basic validation: ensure King exists
-                if 'k' not in fen.lower(): # Very basic check
-                    # print(f"Invalid FEN (No King): {fen}") # Reduce spam
-                    self.msleep(500)
+                # Validation: ensure exactly one King of each color
+                if not self.is_valid_fen(fen):
+                    # print(f"Invalid FEN (Kings check failed): {fen}") 
+                    self.msleep(200) # Retry faster to get a good frame
                     continue
                 
                 # Optimization: Don't re-analyze same position
@@ -50,14 +68,13 @@ class AnalysisThread(QThread):
                 self.last_fen = fen
                 print(f"New FEN detected: {fen}")
                 
-                best_move = self.engine.analyze(fen, time_limit=1.0) # Give it a bit more time now that we cache
+                best_move = self.engine.analyze(fen, time_limit=1.0)
                 
                 if best_move:
                     print(f"Move: {best_move}")
-                    self.fen_updated.emit(fen, str(best_move))
+                    self.fen_updated.emit(fen, best_move)
                 else:
                     print(f"Engine returned None for FEN: {fen}")
-                    self.fen_updated.emit(fen, "No Move Found (Check logs)")
                     self.last_fen = None # Retry next time if it failed
             
             self.msleep(100) # Fast loop, but governed by FEN change

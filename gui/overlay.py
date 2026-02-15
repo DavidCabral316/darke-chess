@@ -167,11 +167,18 @@ class OverlayWindow(QWidget):
             
             # Draw Source (Green-ish transparent)
             src_rect = self.get_square_rect(src)
-            painter.setBrush(QColor(0, 255, 0, 100)) 
+            # Adjust to bottom strip (Plan B: Allow clicking the piece)
+            src_strip = QRect(src_rect.x(), src_rect.y() + int(src_rect.height() * 0.75), 
+                              src_rect.width(), int(src_rect.height() * 0.25))
+            
+            painter.setBrush(QColor(0, 255, 0, 180)) # More opaque since it's smaller
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(src_rect)
+            painter.drawRect(src_strip)
             
             # Draw Dest (Blue-ish transparent)
             dst_rect = self.get_square_rect(dst)
-            painter.setBrush(QColor(0, 0, 255, 100))
-            painter.drawRect(dst_rect)
+            dst_strip = QRect(dst_rect.x(), dst_rect.y() + int(dst_rect.height() * 0.75), 
+                              dst_rect.width(), int(dst_rect.height() * 0.25))
+                              
+            painter.setBrush(QColor(0, 0, 255, 180))
+            painter.drawRect(dst_strip)
