@@ -33,11 +33,26 @@ class AnalysisThread(QThread):
         self._desync_frames = 0
         self._last_logged_status = None
 
+
+    def _board_diff_count(self, fen1, fen2):
+        """Counts how many squares differ between two board FEN strings."""
+        def expand_fen(f):
+            result = []
+            for char in f:
+                if char.isdigit():
+                    result.extend(['.'] * int(char))
+                else:
+                    result.append(char)
+            return "".join(result).replace("/", "")
+        
+        s1 = expand_fen(fen1)
+        s2 = expand_fen(fen2)
+        return sum(1 for a, b in zip(s1, s2) if a != b)
+
     def _sync_to_board_part(self, board_part):
         """
         Attempts to find a legal move that leads to board_part.
-        If not found, or if it's the start position, re-initializes.
-        Returns True if a move was applied or board was synced.
+        Tolerates up to 2 misread squares via fuzzy matching.
         """
         # 1. Check if it's already in sync
         if self.virtual_board.board_fen() == board_part:
@@ -51,19 +66,47 @@ class AnalysisThread(QThread):
                 self.virtual_board.reset()
             return True
 
-        # 3. Check for legal moves
+        # 3. Check for exact legal moves first
         for move in self.virtual_board.legal_moves:
             self.virtual_board.push(move)
             if self.virtual_board.board_fen() == board_part:
-                print(f"Detected move: {move.uci()} (applied to state)")
+                print(f"Detected move: {move.uci()} (exact match)")
                 return True
             self.virtual_board.pop()
 
-        # 4. If nothing matches, increment desync
+        # 4. Fuzzy Match: If no exact match, try legal moves with small error tolerance
+        # (This handles vision misreads due to move highlights)
+        best_fuzzy_move = None
+        min_diff = 99
+        
+        for move in self.virtual_board.legal_moves:
+            self.virtual_board.push(move)
+            diff = self._board_diff_count(self.virtual_board.board_fen(), board_part)
+            if diff < min_diff:
+                min_diff = diff
+                best_fuzzy_move = move
+            self.virtual_board.pop()
+            
+        if best_fuzzy_move and min_diff <= 2:
+            self.virtual_board.push(best_fuzzy_move)
+            print(f"Detected move: {best_fuzzy_move.uci()} (fuzzy match, diff={min_diff})")
+            return True
+
+        # 5. Desync Handling
         self._desync_frames += 1
-        if self._desync_frames > 15: # ~2.5 seconds of consistent desync
-             # Force sync using heuristic for turn detection
-             # Try user's turn first, then opponent's
+        if self._desync_frames % 10 == 0:
+            print(f"[DEBUG] Desync for {self._desync_frames} frames.")
+            print(f"  Seen on screen: {board_part}")
+            print(f"  Internal state: {self.virtual_board.board_fen()}")
+            # Show a few expected next states
+            expected = [self.virtual_board.board_fen()]
+            for m in list(self.virtual_board.legal_moves)[:3]:
+                self.virtual_board.push(m)
+                expected.append(self.virtual_board.board_fen())
+                self.virtual_board.pop()
+            print(f"  Expected one of: {expected}")
+
+        if self._desync_frames > 30: # ~5 seconds of consistent desync
              my_side = 'w' if self.side == 'white' else 'b'
              opp_side = 'b' if self.side == 'white' else 'w'
              
@@ -72,7 +115,7 @@ class AnalysisThread(QThread):
                  try:
                      b = chess.Board(test_fen)
                      if b.is_valid():
-                         print(f"Desync recovered. Snapping to {s} to move.")
+                         print(f"CRITICAL: Desync recovery forcing snap to {s} to move.")
                          self.virtual_board = b
                          self._desync_frames = 0
                          return True
