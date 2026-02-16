@@ -142,16 +142,35 @@ class ChessEngine:
         """Basic sanity check to prevent Stockfish from hanging on garbage FENs."""
         try:
             parts = fen.split()
-            if len(parts) < 1: return False
+            if len(parts) < 1:
+                return False
+
             board_part = parts[0]
+
             # Must have exactly one white king and one black king
             if board_part.count('K') != 1 or board_part.count('k') != 1:
                 return False
+
             # Check row counts
             rows = board_part.split('/')
-            if len(rows) != 8: return False
+            if len(rows) != 8:
+                return False
+
+            valid_chars = set("prnbqkPRNBQK12345678")
+            for row in rows:
+                squares = 0
+                for ch in row:
+                    if ch not in valid_chars:
+                        return False
+                    if ch.isdigit():
+                        squares += int(ch)
+                    else:
+                        squares += 1
+                if squares != 8:
+                    return False
+
             return True
-        except:
+        except Exception:
             return False
 
     def analyze(self, fen, time_limit=1.0, skill_level=None):

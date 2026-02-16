@@ -1,6 +1,6 @@
 import ctypes
 from PyQt6.QtWidgets import QWidget, QApplication, QRubberBand
-from PyQt6.QtCore import Qt, QRect, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, pyqtSignal, QTimer
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
 
 class OverlayWindow(QWidget):
@@ -28,6 +28,9 @@ class OverlayWindow(QWidget):
         self.parent_rect = None
         
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.clear)
         
         # Force Topmost via Windows API
         self._ensure_topmost()
@@ -58,6 +61,9 @@ class OverlayWindow(QWidget):
 
     def clear(self):
         self.best_move = None
+        self.parent_rect = None
+        self.hide_timer.stop()
+        self.hide()
         self.update()
 
     def start_selection_mode(self):
@@ -77,6 +83,7 @@ class OverlayWindow(QWidget):
         self._ensure_topmost(click_through=True)
         self.show()
         self.update()
+        self.hide_timer.start(1400)
 
     def mousePressEvent(self, event):
         if self.is_selecting:

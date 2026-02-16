@@ -1,4 +1,5 @@
 import sys
+import time
 import chess
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton, 
                              QLabel, QComboBox, QCheckBox, QGroupBox, QMessageBox)
@@ -23,7 +24,7 @@ class AnalysisThread(QThread):
         self.vision = vision
         self.engine = engine
         self.running = False
-        self.region = None
+        self.region: tuple[int, int, int, int] | None = None
         self.side = 'white'
         self.last_analyzed_board = None  # Board part only (no side/castling)
         self.recent_reads = []  # Rolling window of recent board reads
@@ -33,6 +34,16 @@ class AnalysisThread(QThread):
         self.virtual_board = chess.Board()
         self._desync_frames = 0
         self._last_logged_status = None
+        self.overlay_cooldown_until = 0.0
+
+    def reset_state(self):
+        self.last_analyzed_board = None
+        self.recent_reads.clear()
+        self._stall_counter = 0
+        self._desync_frames = 0
+        self._last_logged_status = None
+        self.virtual_board = chess.Board()
+        self.overlay_cooldown_until = 0.0
 
 
     def _board_diff_count(self, fen1, fen2):
@@ -85,56 +96,40 @@ class AnalysisThread(QThread):
             self._desync_frames = 0
             return True
 
-        # III. Search Legal Plies (1-2 moves ahead)
-        # This handles Opponent Move -> Our Turn
+        # III. Search Legal plies (one move transition)
         for move1 in self.virtual_board.legal_moves:
             self.virtual_board.push(move1)
-            # Check 1 ply (Opponent moved)
             if self.virtual_board.board_fen() == board_part:
                 print(f"Move Recognized: {move1.uci()}")
                 self.move_detected.emit()
                 self._desync_frames = 0
                 return True
-            
-            # Check 2 plies (We moved, now it's our turn again - or we moved and opponent hasn't)
-            # Actually, our turn analysis usually pushes once.
-            
+
             self.virtual_board.pop()
 
-        # IV. Fuzzy Match for continuity (Tolerate 1-2 minor misreads if kings are same)
-        curr_diff = self._board_diff_count(self.virtual_board.board_fen(), board_part)
-        if curr_diff <= 2:
-            # If kings moved, it's not fuzzy background noise
-            if self.virtual_board.piece_at(chess.E1) == chess.Piece(chess.KING, chess.WHITE) and \
-               board_part.find('K') != -1: # Minimal check
-                self._desync_frames = 0
-                return True
-
-        # V. Recovery Snap (Last Resort)
+        # IV. Recovery Snap (Last Resort)
         self._desync_frames += 1
-        if self._desync_frames > 50: # ~7 seconds
-             print(f"CRITICAL: Persistent desync. Checking for board reset or stable state...")
-             # Only snap if board is stable (most common in window) AND sane
-             # Already checked sanity above.
-             my_side = 'w' if self.side == 'white' else 'b'
-             opp_side = 'b' if self.side == 'white' else 'w'
-             
-             for s in [my_side, opp_side]:
-                 try:
-                     test_fen = f"{board_part} {s} - - 0 1"
-                     b = chess.Board(test_fen)
-                     if not b.is_valid():
-                         continue
-                     
-                     print(f"Recovery SUCCESS: Snapping to {s} to move.")
-                     self.virtual_board = b
-                     self.last_analyzed_board = None
-                     self._desync_frames = 0
-                     return True
-                 except Exception as e:
-                     if self._desync_frames % 20 == 0:
-                         print(f"[DEBUG] Recovery FEN invalid: {test_fen}")
-                     continue
+        if self._desync_frames > 45:
+            print("CRITICAL: Persistent desync. Trying hard resync...")
+            my_side = 'w' if self.side == 'white' else 'b'
+            opp_side = 'b' if self.side == 'white' else 'w'
+
+            for s in [my_side, opp_side]:
+                test_fen = f"{board_part} {s} - - 0 1"
+                try:
+                    b = chess.Board(test_fen)
+                    if not b.is_valid():
+                        continue
+
+                    print(f"Recovery SUCCESS: Snapping to {s} to move")
+                    self.virtual_board = b
+                    self.last_analyzed_board = None
+                    self._desync_frames = 0
+                    return True
+                except Exception:
+                    if self._desync_frames % 20 == 0:
+                        print(f"[DEBUG] Recovery FEN invalid for side {s}")
+                    continue
         
         return False
 
@@ -151,10 +146,15 @@ class AnalysisThread(QThread):
 
     def run(self):
         self.running = True
+        self.reset_state()
         print(f"Analysis started. Playing as: {self.side}")
         while self.running:
             if not self.region:
                 self.msleep(500)
+                continue
+
+            if time.time() < self.overlay_cooldown_until:
+                self.msleep(60)
                 continue
             
             # 1. Capture Board
@@ -233,7 +233,9 @@ class AnalysisThread(QThread):
                     move = chess.Move.from_uci(best_move)
                     if move in self.virtual_board.legal_moves:
                         print(f"Suggestion: {best_move} ✓")
+                        self.vision.set_expected_player_move(best_move)
                         self.fen_updated.emit(current_full_fen, best_move)
+                        self.overlay_cooldown_until = time.time() + 1.5
                     else:
                         print(f"Warning: Engine suggested illegal move {best_move}")
                         self.last_analyzed_board = None
@@ -369,14 +371,34 @@ class ControlWindow(QWidget):
         # Determine orientation
         orientation_text = self.combo_side.currentText()
         orientation = 'white' if "White" in orientation_text else 'black'
-        
-        self.vision.calibrate(frame, orientation)
-        self.status_label.setText("Status: Calibrated!")
+
+        ok, msg = self.vision.calibrate(frame, orientation)
+        if not ok:
+            self.status_label.setText("Status: Calibration failed")
+            QMessageBox.warning(self, "Calibration Failed", msg)
+            self.btn_start.setEnabled(False)
+            return
+
+        self.analysis_thread.reset_state()
+        self.analysis_thread.virtual_board = chess.Board()
+        self.status_label.setText("Status: Calibrated (start position)")
         self.btn_start.setEnabled(True)
 
     def start_analysis(self):
         if not self.vision.is_calibrated:
             QMessageBox.warning(self, "Error", "Calibrate first!")
+            return
+
+        orientation_text = self.combo_side.currentText()
+        if "White" not in orientation_text:
+            QMessageBox.warning(
+                self,
+                "Unsupported Orientation",
+                "Current stable mode supports only white at bottom.",
+            )
+            return
+
+        if self.analysis_thread.isRunning():
             return
 
         print("Start Analysis Clicked")
@@ -386,9 +408,8 @@ class ControlWindow(QWidget):
         self.btn_calibrate.setEnabled(False)
         
         # Update thread settings
-        orientation_text = self.combo_side.currentText()
         self.analysis_thread.side = 'white' if "White" in orientation_text else 'black'
-        
+
         self.analysis_thread.start()
 
     def stop_analysis(self):
